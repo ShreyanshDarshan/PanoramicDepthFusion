@@ -55,7 +55,7 @@ def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
 
     _, _, Wc, _ = color.shape
     mask = generate_mask(cube_size=Wc, fov=120, device=color.device)  # H, W
-    d2d_fac = depth_to_distance_fac(cube_size=Wc, fov=120, device=color.device)  # H, W
+
     disp_sharp_cube = {}
     for face in color_cube:
         inputs = {
@@ -63,14 +63,14 @@ def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
         }
         with torch.no_grad():
             output = model(**inputs, return_dict=True)
-        disp_sharp = output.predicted_depth / d2d_fac[None, ...]
+        disp_sharp = output.predicted_depth
         disp_sharp_cube[face] = disp_sharp
         # plt.imshow(disp_sharp[0].cpu(), cmap="turbo")
         # plt.show()
     disp_sharp_unmerged = cube2equi_pad(disp_sharp_cube, 120)
 
-    aligner = Aligner()
-    disps_aligned = aligner.align(dict_to_tensor(disp_sharp_cube), depth, fov=120)
+    aligner = Aligner(dict_to_tensor(disp_sharp_cube), depth, fov=120)
+    disps_aligned = aligner.align()
 
     disp_aligned_unmerged = cube2equi_pad(disps_aligned, 120, "tensor")
     disp_sharp = merge_cube2equi(disp_aligned_unmerged, fov=120, type="tensor")
