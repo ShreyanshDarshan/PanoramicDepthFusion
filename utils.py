@@ -19,6 +19,7 @@ def load_color(path, device="cuda"):
         torch.Tensor: The panorama image as a tensor.
     """
     img = cv2.imread(path, cv2.IMREAD_COLOR)
+    img = cv2.resize(img, (2048, 1024), interpolation=cv2.INTER_LINEAR)
     if img is None:
         raise FileNotFoundError(f"Image not found at {path}")
 
@@ -134,14 +135,6 @@ def merge_cube2equi(equi, fov, type="dict"):
     mask_cube = generate_mask(cube_size=H, fov=fov, device=device)  # H, H
     mask_cube = mask_cube[None, None, ...].repeat(F, 1, 1, 1)  # F, 1, H, H
     mask_equi = cube2equi_pad(mask_cube, fov=fov, type="tensor")  # F, 1, H, W
-
-    # if type == "tensor":
-    #     import matplotlib.pyplot as plt
-
-    #     plt.imshow(mask_equi[0, 0].cpu(), cmap="gray")
-    #     plt.show()
-    #     plt.imshow(equi[0, 0].cpu())
-    #     plt.show()
 
     if type == "dict":
         equi_final = torch.zeros((C, H, W), dtype=torch.float32, device=device)

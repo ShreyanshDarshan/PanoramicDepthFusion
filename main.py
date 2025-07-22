@@ -92,12 +92,12 @@ if __name__ == "__main__":
     print(f"Color tensor shape: {color_tensor.shape}")
     # print(f"Depth tensor shape: {depth_tensor.shape}")
 
-    image_processor = AutoImageProcessor.from_pretrained(
-        "depth-anything/Depth-Anything-V2-Small-hf"
-    )
+    # image_processor = AutoImageProcessor.from_pretrained(
+    #     "depth-anything/Depth-Anything-V2-Small-hf"
+    # )
     model = (
         AutoModelForDepthEstimation.from_pretrained(
-            "depth-anything/Depth-Anything-V2-Small-hf"
+            "depth-anything/Depth-Anything-V2-Large-hf"
         )
         .to(args.device)
         .eval()

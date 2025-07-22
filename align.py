@@ -50,8 +50,8 @@ class Aligner:
     def __init__(
         self,
         grid_size=[5, 10, 15],
-        lr=[1e-2, 1e-2, 1e-2],
-        align_iters=[10, 10, 10],
+        lr=[5e-2, 2e-2, 1e-2],
+        align_iters=[150, 100, 80],
         px_ratio=0.01,
         num_disps=6,
         device="cuda",
@@ -90,6 +90,12 @@ class Aligner:
         optimizer = torch.optim.Adam(
             self.scalers[stage].parameters(), lr=self.lr[stage]
         )
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=1.0,
+            total_iters=self.align_iters[stage],
+        )
         self.scalers[stage].train()
         for step in tqdm(
             range(self.align_iters[stage])
@@ -101,6 +107,7 @@ class Aligner:
 
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             self.writer.add_scalars(f"aligner/stage_{stage}/loss", loss_dict, step)
             if step % 10 == 0 or step == self.align_iters[stage] - 1:
