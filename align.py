@@ -27,7 +27,7 @@ class Scaler(nn.Module):
             torch.zeros((self.T, grid_size, grid_size), requires_grad=True)
         )
 
-    def forward(self, disps):
+    def forward(self, disps, sky_masks):
         T, _, H, W = disps.shape
         assert T == self.T, f"Expected {self.T} disparity samples, but got {T}"
         scale_high = F.interpolate(
@@ -43,6 +43,7 @@ class Scaler(nn.Module):
             align_corners=False,
         )
         disps = disps * scale_high + offset_high
+        disps[sky_masks] = 0.0  # Set sky pixels to 0
         return disps
 
 
@@ -51,7 +52,7 @@ class Aligner:
         self,
         grid_size=[4, 8, 16],
         lr=[5e-2, 2e-2, 1e-2],
-        align_iters=[100, 100, 100],
+        align_iters=[150, 100, 80],
         px_ratio=0.01,
         num_disps=6,
         device="cuda",
@@ -74,19 +75,22 @@ class Aligner:
             disps (torch.Tensor): Disparity maps of shape (F, C, H, W).
             fov (int): Field of view for the cube to equi conversion.
         """
+        sky_masks = disps == 0
         disps = self.normalize_disps(disps)
         pair_masks = self.get_masks(disps, fov=fov)
 
         for stage in range(self.num_stages):
-            self.align_stage(disps, pair_masks, stage, fov=fov)
+            self.align_stage(disps, pair_masks, sky_masks, stage, fov=fov)
             self.scalers[stage].eval()
             with torch.no_grad():
-                disps = self.scalers[stage](disps)
+                disps = self.scalers[stage](disps, sky_masks)
             self.scalers[stage].train()
 
+        disps -= disps.min() - 1
+        disps[sky_masks] = 0
         return disps
 
-    def align_stage(self, disps, masks, stage, fov=120):
+    def align_stage(self, disps, pair_masks, sky_masks, stage, fov=120):
         optimizer = torch.optim.Adam(
             self.scalers[stage].parameters(), lr=self.lr[stage]
         )
@@ -101,8 +105,8 @@ class Aligner:
             range(self.align_iters[stage])
         ):  # Number of iterations per stage
             optimizer.zero_grad()
-            scaled_disps = self.scalers[stage](disps)
-            loss_dict = self.loss(scaled_disps, masks, stage)
+            scaled_disps = self.scalers[stage](disps, sky_masks)
+            loss_dict = self.loss(scaled_disps, pair_masks, stage)
             loss = loss_dict["total_loss"]
 
             loss.backward()
@@ -111,7 +115,7 @@ class Aligner:
 
             self.writer.add_scalars(f"aligner/stage_{stage}/loss", loss_dict, step)
             if step % 10 == 0 or step == self.align_iters[stage] - 1:
-                eval_out = self.eval_iter(disps, stage, fov=fov)
+                eval_out = self.eval_iter(disps, sky_masks, stage, fov=fov)
                 self.writer.add_image(
                     f"aligner/stage_{stage}/equi_disp",
                     eval_out["equi_disp_img"],
@@ -186,10 +190,12 @@ class Aligner:
                     pair_masks[key] = mask
         return pair_masks
 
-    def eval_iter(self, disps, stage, fov=120):
+    def eval_iter(self, disps, sky_masks, stage, fov=120):
         self.scalers[stage].eval()
         with torch.no_grad():
-            scaled_disps = self.scalers[stage](disps)
+            scaled_disps = self.scalers[stage](disps, sky_masks)
+            scaled_disps -= scaled_disps.min() - 1
+            scaled_disps[sky_masks] = 0
             equi_disps = cube2equi_pad(scaled_disps, fov=fov, type="tensor")
             equi_disp = merge_cube2equi(equi_disps, fov=fov, type="tensor")
             # colormap for visualization

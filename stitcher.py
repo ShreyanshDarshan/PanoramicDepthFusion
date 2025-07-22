@@ -41,7 +41,7 @@ class Stitcher:
             self.weights, fov=fov, type="tensor"
         )  # F, 1, H, W
 
-        self.optimizer = torch.optim.Adam(self.disp_stitched.parameters(), lr=1e-2)
+        self.optimizer = torch.optim.Adam(self.disp_stitched.parameters(), lr=3e-3)
         self.scheduler = torch.optim.lr_scheduler.LinearLR(
             self.optimizer, start_factor=1.0, end_factor=1.0, total_iters=self.iters
         )
@@ -69,6 +69,8 @@ class Stitcher:
                     dataformats="HWC",
                 )
 
+        sky_mask = self.in_disps_equi == 0
+        self.disp_stitched.disp.data[sky_mask] = 0
         return self.disp_stitched.disp.data.detach()
 
     def loss(self, disp_cube, disps):
@@ -80,7 +82,7 @@ class Stitcher:
 
     def fidelity_loss(self, disp_cube, disps):
         # Compute the fidelity loss between the stitched disparity and individual disparities
-        mask = self.weights > 0.9999
+        mask = (self.weights > 0.9999) & (disps != 0)
         fidelity_loss = torch.mean((disp_cube[mask] - disps[mask]) ** 2)
         return fidelity_loss
 
@@ -91,7 +93,7 @@ class Stitcher:
         xgrad_disps = self.in_disps_equi[..., :, 1:] - self.in_disps_equi[..., :, :-1]
         ygrad_disps = self.in_disps_equi[..., 1:, :] - self.in_disps_equi[..., :-1, :]
 
-        wts = self.wts_equi > 0
+        wts = (self.wts_equi > 0) & (self.in_disps_equi != 0)
         mask_x = wts[..., :, 1:] & wts[..., :, :-1]
         mask_y = wts[..., 1:, :] & wts[..., :-1, :]
         weights_x = self.wts_equi[..., :, 1:] * self.wts_equi[..., :, :-1]
