@@ -54,9 +54,9 @@ class Aligner:
         disps,
         depth_equi=None,
         fov=120,
-        grid_size=[1, 4, 8, 16],
-        lr=[5e-2, 5e-2, 2e-2, 1e-2],
-        align_iters=[100, 150, 100, 80],
+        grid_size=[1],
+        lr=[5e-2],
+        align_iters=[200],
         px_ratio=0.01,
         num_disps=6,
         device="cuda",
@@ -116,7 +116,7 @@ class Aligner:
         scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1.0,
-            end_factor=1.0,
+            end_factor=0.2,
             total_iters=self.align_iters[stage],
         )
         self.scalers[stage].train()
@@ -164,8 +164,9 @@ class Aligner:
     def loss(self, disps, pair_masks, stage, depths_cube=None):
         loss_dict = {
             "alignment_loss": self.alignment_loss(disps, pair_masks),
+            "alignment_grad_loss": 20 * self.alignment_grad_loss(disps, pair_masks),
             "smoothness_loss": 40 * self.smoothness_loss(stage),
-            "scale_loss": 0.007 * self.scale_loss(stage, depths_cube=depths_cube),
+            "scale_loss": 0.0001 * self.scale_loss(stage, depths_cube=depths_cube),
             "metric_loss": 2 * self.metric_loss(disps, depth_cubes=depths_cube),
             "metric_loss_grad": 20
             * self.metric_loss_grad(disps, depth_cubes=depths_cube),
@@ -233,10 +234,38 @@ class Aligner:
             disp1 = equi_disps_dict[face1]
             disp2 = equi_disps_dict[face2]
             diff = disp1[mask] - disp2[mask]
+
             # px_mask = torch.rand(diff.numel(), device=diff.device) < self.px_ratio
             # diff_masked = diff.view(-1)[px_mask]
             # select random pixels for loss calculation
             loss += (diff**2).mean()
+        loss /= len(pair_masks)
+        return loss
+
+    def alignment_grad_loss(self, disps, pair_masks):
+        loss = 0.0
+        equi_disps = cube2equi_pad(disps, fov=self.fov, type="tensor")
+        equi_disps_dict = tensor_to_dict(equi_disps)
+        for face1, face2 in pair_masks:
+            mask = pair_masks[(face1, face2)]
+            disp1 = equi_disps_dict[face1]
+            disp2 = equi_disps_dict[face2]
+
+            gradx_disp1 = disp1[..., :, 1:] - disp1[..., :, :-1]
+            grady_disp1 = disp1[..., 1:, :] - disp1[..., :-1, :]
+            gradx_disp2 = disp2[..., :, 1:] - disp2[..., :, :-1]
+            grady_disp2 = disp2[..., 1:, :] - disp2[..., :-1, :]
+
+            maskx = mask[..., :, 1:] & mask[..., :, :-1]
+            masky = mask[..., 1:, :] & mask[..., :-1, :]
+            gradx_diff = gradx_disp1[maskx] - gradx_disp2[maskx]
+            grady_diff = grady_disp1[masky] - grady_disp2[masky]
+            grad_diff = (gradx_diff**2).mean() + (grady_diff**2).mean()
+
+            # px_mask = torch.rand(diff.numel(), device=diff.device) < self.px_ratio
+            # diff_masked = diff.view(-1)[px_mask]
+            # select random pixels for loss calculation
+            loss += grad_diff
         loss /= len(pair_masks)
         return loss
 
