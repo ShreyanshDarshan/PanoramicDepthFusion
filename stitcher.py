@@ -53,7 +53,7 @@ class Stitcher:
             self.optimizer, start_factor=1.0, end_factor=1.0, total_iters=self.iters
         )
 
-        self.writer = SummaryWriter("runs/stitcher")
+        self.writer = SummaryWriter("runs/")
         self.disp_stitched.to(device)
 
     def stitch(self):
@@ -72,6 +72,12 @@ class Stitcher:
                 self.writer.add_image(
                     "stitcher/equi_disp",
                     eval_out["equi_disp_img"],
+                    step,
+                    dataformats="HWC",
+                )
+                self.writer.add_image(
+                    "stitcher/equi_depth",
+                    eval_out["equi_depth_img"],
                     step,
                     dataformats="HWC",
                 )
@@ -128,7 +134,23 @@ class Stitcher:
             equi_disp = matplotlib.colormaps.get_cmap("turbo")(equi_disp)[:, :, :3]
             equi_disp = (equi_disp * 255).astype(np.uint8)
 
+            equi_depth = 1 / disp_stitched
+            equi_depth[disp_stitched == 0] = 0
+            equi_depth = torch.clip(
+                equi_depth,
+                torch.quantile(equi_depth, 0.03),
+                torch.quantile(equi_depth, 0.97),
+            )
+            equi_depth = (equi_depth - equi_depth.min()) / (
+                equi_depth.max() - equi_depth.min()
+            )
+            equi_depth = (equi_depth * 255).byte().cpu().numpy()
+            equi_depth = np.transpose(equi_depth, (1, 2, 0))[..., 0]  # H, W
+            equi_depth = matplotlib.colormaps.get_cmap("turbo")(equi_depth)[:, :, :3]
+            equi_depth = (equi_depth * 255).astype(np.uint8)
+
         eval_out = {
             "equi_disp_img": equi_disp,
+            "equi_depth_img": equi_depth,
         }
         return eval_out

@@ -191,3 +191,49 @@ def depth_to_distance_fac(cube_size, fov, device):
     rays = np.linalg.norm(rays, axis=-1)
     rays_t = torch.tensor(rays, dtype=torch.float32, device=device)
     return rays_t
+
+
+def color_tensor_to_img(color_tensor):
+    color_img = color_tensor * 255.0
+    color_img = color_img.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    return color_img
+
+
+def save_point_cloud(rgb, depth, path, mask=None):
+    ## rgb: (H, W, 3), depth: (H, W)
+    h, w = depth.shape
+    rgb = rgb / 255.0
+    Theta = np.arange(h).reshape(h, 1) * np.pi / h + np.pi / h / 2
+    Theta = np.repeat(Theta, w, axis=1)
+    Phi = np.arange(w).reshape(1, w) * 2 * np.pi / w + np.pi / w - np.pi
+    Phi = -np.repeat(Phi, h, axis=0)
+
+    # mask = np.ones_like(depth, dtype=bool)
+    # mask[:600, :] = False
+
+    X = depth * np.sin(Theta) * np.sin(Phi)
+    Y = depth * np.cos(Theta)
+    Z = depth * np.sin(Theta) * np.cos(Phi)
+
+    if mask is None:
+        X = X.flatten()
+        Y = Y.flatten()
+        Z = Z.flatten()
+        R = rgb[:, :, 0].flatten()
+        G = rgb[:, :, 1].flatten()
+        B = rgb[:, :, 2].flatten()
+    else:
+        X = X[mask]
+        Y = Y[mask]
+        Z = Z[mask]
+        R = rgb[:, :, 0][mask]
+        G = rgb[:, :, 1][mask]
+        B = rgb[:, :, 2][mask]
+
+    XYZ = np.stack([X, Y, Z], axis=1)
+    RGB = np.stack([R, G, B], axis=1)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(XYZ)
+    pcd.colors = o3d.utility.Vector3dVector(RGB)
+    o3d.io.write_point_cloud(path, pcd)

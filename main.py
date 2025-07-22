@@ -19,6 +19,8 @@ from utils import (
     depth_to_distance_fac,
     merge_cube2equi,
     dict_to_tensor,
+    save_point_cloud,
+    color_tensor_to_img,
 )
 from align import Scaler, Aligner
 from stitcher import Stitcher
@@ -41,7 +43,9 @@ def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
         depth = depth_tensor.to(device)
         depth = F.interpolate(
             depth, size=color.shape[2:], mode="bilinear", align_corners=False
-        )
+        )[0]
+    else:
+        depth = None
 
     color_cube = equi2cube_pad(color[0], 120)
     # for face in color_cube:
@@ -66,7 +70,7 @@ def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
     disp_sharp_unmerged = cube2equi_pad(disp_sharp_cube, 120)
 
     aligner = Aligner()
-    disps_aligned = aligner.align(dict_to_tensor(disp_sharp_cube), depth[0], fov=120)
+    disps_aligned = aligner.align(dict_to_tensor(disp_sharp_cube), depth, fov=120)
 
     disp_aligned_unmerged = cube2equi_pad(disps_aligned, 120, "tensor")
     disp_sharp = merge_cube2equi(disp_aligned_unmerged, fov=120, type="tensor")
@@ -75,7 +79,27 @@ def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
     disp_stitched = stitcher.stitch()
     disp_stitched = disp_stitched.cpu().numpy()
 
-    plt.imshow(color[0].permute(1, 2, 0).cpu())
+    depth_stitched = 1 / disp_stitched
+    depth_stitched[disp_stitched == 0] = 0
+
+    depth_sharp = 1 / disp_sharp.cpu().numpy()
+    depth_sharp[disp_sharp.cpu().numpy() == 0] = 0
+
+    color = color_tensor_to_img(color[0])
+
+    save_point_cloud(color, depth_stitched[0], "stitched_point_cloud.ply", mask=None)
+    save_point_cloud(color, depth_sharp[0], "sharp_point_cloud.ply", mask=None)
+    if depth is not None:
+        save_point_cloud(
+            color, depth[0].cpu().numpy(), "original_point_cloud.ply", mask=None
+        )
+    else:
+        print("No depth map provided, skipping original point cloud saving.")
+
+    tifffile.imwrite("stitched_disparity.tiff", disp_stitched[0])
+    tifffile.imwrite("sharp_disparity.tiff", disp_sharp.cpu().numpy()[0])
+
+    plt.imshow(color)
     plt.show()
     plt.imshow(disp_sharp.cpu()[0], cmap="turbo")
     plt.show()
@@ -102,7 +126,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     color_tensor = load_color(args.color, device=args.device)
-    depth_tensor = load_depth(args.depth, device=args.device)
+    if args.depth:
+        depth_tensor = load_depth(args.depth, device=args.device)
+    else:
+        depth_tensor = None
 
     print(f"Color tensor shape: {color_tensor.shape}")
     # print(f"Depth tensor shape: {depth_tensor.shape}")

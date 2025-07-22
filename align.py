@@ -66,7 +66,7 @@ class Aligner:
             Scaler(grid_size=g, num_disps=num_disps).to(device) for g in grid_size
         ]
         self.px_ratio = px_ratio
-        self.writer = SummaryWriter("runs/aligner")
+        self.writer = SummaryWriter("runs/")
 
     def align(self, disps, depth_equi=None, fov=120):
         """
@@ -75,12 +75,14 @@ class Aligner:
             disps (torch.Tensor): Disparity maps of shape (F, C, H, W).
             fov (int): Field of view for the cube to equi conversion.
         """
-        sky_masks = disps == 0
-        disps = self.normalize_disps(disps)
-        pair_masks = self.get_masks(disps, fov=fov)
-
+        depths_cube = None
         if depth_equi is not None:
+            # self.initialize_scaler(depth_equi)
             depths_cube = equi2cube_pad(depth_equi, fov, type="tensor")
+
+        sky_masks = disps == 0
+        disps = self.normalize_disps(disps, depths_cube=depths_cube)
+        pair_masks = self.get_masks(disps, fov=fov)
 
         for stage in range(self.num_stages):
             self.align_stage(
@@ -91,7 +93,7 @@ class Aligner:
                 disps = self.scalers[stage](disps, sky_masks)
             self.scalers[stage].train()
 
-        disps -= disps.min() - 1
+        # disps -= disps.min() - 1
         disps[sky_masks] = 0
         return disps
 
@@ -124,7 +126,9 @@ class Aligner:
 
             self.writer.add_scalars(f"aligner/stage_{stage}/loss", loss_dict, step)
             if step % 10 == 0 or step == self.align_iters[stage] - 1:
-                eval_out = self.eval_iter(disps, sky_masks, stage, fov=fov)
+                eval_out = self.eval_iter(
+                    disps, sky_masks, stage, depths_cube=depths_cube, fov=fov
+                )
                 self.writer.add_image(
                     f"aligner/stage_{stage}/equi_disp",
                     eval_out["equi_disp_img"],
@@ -148,8 +152,10 @@ class Aligner:
         loss_dict = {
             "alignment_loss": self.alignment_loss(disps, pair_masks),
             "smoothness_loss": 40 * self.smoothness_loss(stage),
-            "scale_loss": 0.007 * self.scale_loss(stage),
-            "metric_loss": self.metric_loss(disps, depth_cubes=depths_cube),
+            "scale_loss": 0.007 * self.scale_loss(stage, depths_cube=depths_cube),
+            "metric_loss": 2 * self.metric_loss(disps, depth_cubes=depths_cube),
+            "metric_loss_grad": 20
+            * self.metric_loss_grad(disps, depth_cubes=depths_cube),
         }
         loss_dict["total_loss"] = sum(loss_dict.values())
         return loss_dict
@@ -168,6 +174,31 @@ class Aligner:
         mask = depth_cubes > 0
         loss = torch.mean((disps[mask] - disps_metric[mask]) ** 2)
         return loss
+
+    def metric_loss_grad(self, disps, depth_cubes=None):
+        """
+        Compute the gradient of the metric loss between disparity maps and depth maps.
+        Args:
+            disps (torch.Tensor): Disparity maps of shape (F, C, H, W).
+            depth_cubes (torch.Tensor): Depth maps of shape (F, C, H, W).
+        """
+        if depth_cubes is None:
+            return 0.0
+
+        disps_metric = 1 / depth_cubes
+        mask = depth_cubes > 0
+        xgrad_disp_cube = disps[..., :, 1:] - disps[..., :, :-1]
+        ygrad_disp_cube = disps[..., 1:, :] - disps[..., :-1, :]
+        xgrad_disps = disps_metric[..., :, 1:] - disps_metric[..., :, :-1]
+        ygrad_disps = disps_metric[..., 1:, :] - disps_metric[..., :-1, :]
+        maskx = mask[..., :, 1:] & mask[..., :, :-1]
+        masky = mask[..., 1:, :] & mask[..., :-1, :]
+
+        grad_loss_x = torch.mean(((xgrad_disp_cube - xgrad_disps))[maskx].abs())
+        grad_loss_y = torch.mean(((ygrad_disp_cube - ygrad_disps))[masky].abs())
+        grad_loss = grad_loss_x + grad_loss_y
+
+        return grad_loss
 
     def alignment_loss(self, disps, pair_masks):
         loss = 0.0
@@ -201,7 +232,9 @@ class Aligner:
         )
         return loss
 
-    def scale_loss(self, stage):
+    def scale_loss(self, stage, depths_cube=None):
+        if depths_cube is not None:
+            return 0.0
         scaler = self.scalers[stage]
         scale_grid = scaler.scale_grid
         loss = (1 / scale_grid).mean()
@@ -221,14 +254,27 @@ class Aligner:
                     pair_masks[key] = mask
         return pair_masks
 
-    def eval_iter(self, disps, sky_masks, stage, fov=120):
+    def eval_iter(self, disps, sky_masks, stage, depths_cube=None, fov=120):
         self.scalers[stage].eval()
         with torch.no_grad():
             scaled_disps = self.scalers[stage](disps, sky_masks)
-            scaled_disps -= scaled_disps.min() - 1
+            # scaled_disps -= scaled_disps.min() - 1
             scaled_disps[sky_masks] = 0
             equi_disps = cube2equi_pad(scaled_disps, fov=fov, type="tensor")
             equi_disp_merged = merge_cube2equi(equi_disps, fov=fov, type="tensor")
+            equi_disp_for_later = equi_disp_merged.clone()
+            if depths_cube is not None:
+                disps_cube = 1 / depths_cube
+                disps_cube[depths_cube == 0] = 0
+                metric_disps_equi = cube2equi_pad(disps_cube, fov=fov, type="tensor")
+                metric_disps_equi = merge_cube2equi(
+                    metric_disps_equi, fov=fov, type="tensor"
+                )
+
+                equi_disp_merged = torch.cat(
+                    [equi_disp_merged, metric_disps_equi], dim=1
+                )
+
             # colormap for visualization
             equi_disp = (equi_disp_merged - equi_disp_merged.min()) / (
                 equi_disp_merged.max() - equi_disp_merged.min()
@@ -238,8 +284,15 @@ class Aligner:
             equi_disp = matplotlib.colormaps.get_cmap("turbo")(equi_disp)[:, :, :3]
             equi_disp = (equi_disp * 255).astype(np.uint8)
 
-            equi_depth = 1 / equi_disp_merged
-            equi_depth[equi_disp_merged == 0] = 0
+            equi_depth = 1 / equi_disp_for_later
+            equi_depth[equi_disp_for_later == 0] = 0
+            if depths_cube is not None:
+                metric_depths_equi = cube2equi_pad(depths_cube, fov=fov, type="tensor")
+                metric_depths_equi = merge_cube2equi(
+                    metric_depths_equi, fov=fov, type="tensor"
+                )
+                equi_depth = torch.cat([equi_depth, metric_depths_equi], dim=1)
+
             equi_depth = torch.clip(
                 equi_depth,
                 torch.quantile(equi_depth, 0.03),
@@ -278,13 +331,34 @@ class Aligner:
         }
         return eval_out
 
-    def normalize_disps(self, disps):
+    def normalize_disps(self, disps, depths_cube=None):
         """
         Normalize the disparity maps to the range [0, 1].
         """
         F, C, H, W = disps.shape
         disps_median = torch.median(disps.view(F, -1), dim=1, keepdim=True).values
         disps_dev = disps - disps_median[..., None, None]
-        disps_scale = disps_dev.abs().mean()
-        disps = disps_dev / (disps_scale + 1e-6)
+        disps_scale = torch.mean(disps_dev.abs().view(F, -1), dim=1, keepdim=True)
+        disps = disps_dev / (disps_scale[..., None, None] + 1e-6)
+
+        if depths_cube is not None:
+            disps_metric_cube = 1 / depths_cube
+            disps_metric_cube[depths_cube == 0] = 0
+
+            F, _, _, _ = disps_metric_cube.shape
+            disps_metric_median = torch.median(
+                disps_metric_cube.view(F, -1), dim=1, keepdim=True
+            ).values
+            disps_metric_dev = disps_metric_cube - disps_metric_median[..., None, None]
+            disps_metric_scale = torch.mean(
+                disps_metric_dev.abs().view(F, -1), dim=1, keepdim=True
+            )
+
+            disps = (
+                disps * disps_metric_scale[:, None, None]
+                + disps_metric_median[:, None, None]
+            )
+
+            # breakpoint()
+
         return disps
