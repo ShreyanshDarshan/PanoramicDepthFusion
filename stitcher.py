@@ -29,6 +29,13 @@ class Stitcher:
         self.device = device
         self.input_disps = input_disps
         self.in_disps_equi = cube2equi_pad(input_disps, fov, type="tensor")
+        self.sky_mask = (
+            cube2equi_pad((input_disps == 0).to(torch.uint8), fov, type="tensor")
+            .to(torch.bool)
+            .sum(dim=0)
+            > 0
+        )
+
         self.iters = iters
         F, C, H, W = input_disps.shape
         self.disp_stitched = Disparity([H, 2 * H], fov=self.fov, device=self.device)
@@ -69,8 +76,7 @@ class Stitcher:
                     dataformats="HWC",
                 )
 
-        sky_mask = self.in_disps_equi == 0
-        self.disp_stitched.disp.data[sky_mask] = 0
+        self.disp_stitched.disp.data[self.sky_mask] = 0
         return self.disp_stitched.disp.data.detach()
 
     def loss(self, disp_cube, disps):
@@ -112,6 +118,7 @@ class Stitcher:
         self.disp_stitched.eval()
         with torch.no_grad():
             disp_stitched = self.disp_stitched.disp.data.detach().cpu()
+            disp_stitched[self.sky_mask] = 0
             # colormap for visualization
             equi_disp = (disp_stitched - disp_stitched.min()) / (
                 disp_stitched.max() - disp_stitched.min()
