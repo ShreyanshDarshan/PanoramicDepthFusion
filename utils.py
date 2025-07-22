@@ -151,8 +151,13 @@ def merge_cube2equi(equi, fov, type="dict"):
     return equi_final
 
 
-def generate_mask(cube_size, fov, device):
-    f = cube_size / 2 / np.tan(np.deg2rad(fov))
+def generate_mask(
+    cube_size,
+    fov,
+    device,
+    cube_fov=90,
+):
+    f = cube_size / 2 / np.tan(np.deg2rad(fov / 2))
     # Create a mask with a white square in the center fading to black at the borders using Manhattan distance
     yy, xx = np.meshgrid(
         np.linspace(-1, 1, cube_size), np.linspace(-1, 1, cube_size), indexing="ij"
@@ -162,7 +167,8 @@ def generate_mask(cube_size, fov, device):
     # Normalize so that center is 1, borders are 0 (fade radius is 0.5)
     fade = np.clip(1 - dist, 0, 1)
     # Get fade value at inner square border
-    fade_border = fade[int(cube_size / 2 + f), cube_size // 2]
+    tan_fov = np.tan(np.deg2rad(cube_fov / 2))
+    fade_border = fade[int(cube_size / 2 + f * tan_fov), cube_size // 2]
     fade = np.clip(fade, 0, fade_border)
     fade = fade / fade_border
     mask = torch.tensor(fade, dtype=torch.float32, device=device)

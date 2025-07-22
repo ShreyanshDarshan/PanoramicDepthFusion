@@ -21,6 +21,7 @@ from utils import (
     dict_to_tensor,
 )
 from align import Scaler, Aligner
+from stitcher import Stitcher
 
 
 def panoramic_da(color_tensor, model, device="cuda"):
@@ -65,9 +66,15 @@ def panoramic_da(color_tensor, model, device="cuda"):
     disp_aligned_unmerged = cube2equi_pad(disps_aligned, 120, "tensor")
     disp_sharp = merge_cube2equi(disp_aligned_unmerged, fov=120, type="tensor")
 
+    stitcher = Stitcher(disps_aligned, disp_sharp, fov=120, device=device)
+    disp_stitched = stitcher.stitch()
+    disp_stitched = disp_stitched.cpu().numpy()
+
     plt.imshow(color[0].permute(1, 2, 0).cpu())
     plt.show()
     plt.imshow(disp_sharp.cpu()[0], cmap="turbo")
+    plt.show()
+    plt.imshow(disp_stitched[0], cmap="turbo")
     plt.show()
 
 

@@ -49,9 +49,9 @@ class Scaler(nn.Module):
 class Aligner:
     def __init__(
         self,
-        grid_size=[5, 10, 15],
+        grid_size=[4, 8, 16],
         lr=[5e-2, 2e-2, 1e-2],
-        align_iters=[150, 100, 80],
+        align_iters=[100, 100, 100],
         px_ratio=0.01,
         num_disps=6,
         device="cuda",
