@@ -68,7 +68,7 @@ class Aligner:
         self.px_ratio = px_ratio
         self.writer = SummaryWriter("runs/aligner")
 
-    def align(self, disps, fov=120):
+    def align(self, disps, depth_equi=None, fov=120):
         """
         Align disparity maps across multiple stages.
         Args:
@@ -79,8 +79,13 @@ class Aligner:
         disps = self.normalize_disps(disps)
         pair_masks = self.get_masks(disps, fov=fov)
 
+        if depth_equi is not None:
+            depths_cube = equi2cube_pad(depth_equi, fov, type="tensor")
+
         for stage in range(self.num_stages):
-            self.align_stage(disps, pair_masks, sky_masks, stage, fov=fov)
+            self.align_stage(
+                disps, pair_masks, sky_masks, stage, depths_cube=depths_cube, fov=fov
+            )
             self.scalers[stage].eval()
             with torch.no_grad():
                 disps = self.scalers[stage](disps, sky_masks)
@@ -90,7 +95,9 @@ class Aligner:
         disps[sky_masks] = 0
         return disps
 
-    def align_stage(self, disps, pair_masks, sky_masks, stage, fov=120):
+    def align_stage(
+        self, disps, pair_masks, sky_masks, stage, depths_cube=None, fov=120
+    ):
         optimizer = torch.optim.Adam(
             self.scalers[stage].parameters(), lr=self.lr[stage]
         )
@@ -106,7 +113,9 @@ class Aligner:
         ):  # Number of iterations per stage
             optimizer.zero_grad()
             scaled_disps = self.scalers[stage](disps, sky_masks)
-            loss_dict = self.loss(scaled_disps, pair_masks, stage)
+            loss_dict = self.loss(
+                scaled_disps, pair_masks, stage, depths_cube=depths_cube
+            )
             loss = loss_dict["total_loss"]
 
             loss.backward()
@@ -123,20 +132,42 @@ class Aligner:
                     dataformats="HWC",
                 )
                 self.writer.add_image(
+                    f"aligner/stage_{stage}/equi_depth",
+                    eval_out["equi_depth_img"],
+                    step,
+                    dataformats="HWC",
+                )
+                self.writer.add_image(
                     f"aligner/stage_{stage}/scalar_img",
                     eval_out["scalar_img"],
                     step,
                     dataformats="HWC",
                 )
 
-    def loss(self, disps, pair_masks, stage):
+    def loss(self, disps, pair_masks, stage, depths_cube=None):
         loss_dict = {
             "alignment_loss": self.alignment_loss(disps, pair_masks),
             "smoothness_loss": 40 * self.smoothness_loss(stage),
             "scale_loss": 0.007 * self.scale_loss(stage),
+            "metric_loss": self.metric_loss(disps, depth_cubes=depths_cube),
         }
         loss_dict["total_loss"] = sum(loss_dict.values())
         return loss_dict
+
+    def metric_loss(self, disps, depth_cubes=None):
+        """
+        Compute the metric loss between disparity maps and depth maps.
+        Args:
+            disps (torch.Tensor): Disparity maps of shape (F, C, H, W).
+            depth_cubes (torch.Tensor): Depth maps of shape (F, C, H, W).
+        """
+        if depth_cubes is None:
+            return 0.0
+
+        disps_metric = 1 / depth_cubes
+        mask = depth_cubes > 0
+        loss = torch.mean((disps[mask] - disps_metric[mask]) ** 2)
+        return loss
 
     def alignment_loss(self, disps, pair_masks):
         loss = 0.0
@@ -197,16 +228,30 @@ class Aligner:
             scaled_disps -= scaled_disps.min() - 1
             scaled_disps[sky_masks] = 0
             equi_disps = cube2equi_pad(scaled_disps, fov=fov, type="tensor")
-            equi_disp = merge_cube2equi(equi_disps, fov=fov, type="tensor")
+            equi_disp_merged = merge_cube2equi(equi_disps, fov=fov, type="tensor")
             # colormap for visualization
-            equi_disp = (equi_disp - equi_disp.min()) / (
-                equi_disp.max() - equi_disp.min()
+            equi_disp = (equi_disp_merged - equi_disp_merged.min()) / (
+                equi_disp_merged.max() - equi_disp_merged.min()
             )
             equi_disp = (equi_disp * 255).byte().cpu().numpy()
             equi_disp = np.transpose(equi_disp, (1, 2, 0))[..., 0]  # H, W
             equi_disp = matplotlib.colormaps.get_cmap("turbo")(equi_disp)[:, :, :3]
             equi_disp = (equi_disp * 255).astype(np.uint8)
-        self.scalers[stage].train()
+
+            equi_depth = 1 / equi_disp_merged
+            equi_depth[equi_disp_merged == 0] = 0
+            equi_depth = torch.clip(
+                equi_depth,
+                torch.quantile(equi_depth, 0.03),
+                torch.quantile(equi_depth, 0.97),
+            )
+            equi_depth = (equi_depth - equi_depth.min()) / (
+                equi_depth.max() - equi_depth.min()
+            )
+            equi_depth = (equi_depth * 255).byte().cpu().numpy()
+            equi_depth = np.transpose(equi_depth, (1, 2, 0))[..., 0]  # H, W
+            equi_depth = matplotlib.colormaps.get_cmap("turbo")(equi_depth)[:, :, :3]
+            equi_depth = (equi_depth * 255).astype(np.uint8)
 
         scale_imgs = self.scalers[stage].scale_grid.detach().cpu().numpy()
         scale_imgs = (scale_imgs - scale_imgs.min()) / (
@@ -225,8 +270,10 @@ class Aligner:
             scalar_img[:, i * sw : (i + 1) * sw, 0] = scale_img
             scalar_img[:, i * sw : (i + 1) * sw, 1] = offset_img
 
+        self.scalers[stage].train()
         eval_out = {
             "equi_disp_img": equi_disp,
+            "equi_depth_img": equi_depth,
             "scalar_img": scalar_img,
         }
         return eval_out

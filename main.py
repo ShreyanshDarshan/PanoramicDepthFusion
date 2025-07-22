@@ -24,7 +24,7 @@ from align import Scaler, Aligner
 from stitcher import Stitcher
 
 
-def panoramic_da(color_tensor, model, device="cuda"):
+def panoramic_da(color_tensor, depth_tensor, model, device="cuda"):
     """
     Process the panorama and depth images using the PromptDA library.
 
@@ -37,6 +37,11 @@ def panoramic_da(color_tensor, model, device="cuda"):
     # Ensure tensors are on the correct device
     color = color_tensor.to(device)
     color = resize_color(color)  # 1, 3, H, W
+    if depth_tensor is not None:
+        depth = depth_tensor.to(device)
+        depth = F.interpolate(
+            depth, size=color.shape[2:], mode="bilinear", align_corners=False
+        )
 
     color_cube = equi2cube_pad(color[0], 120)
     # for face in color_cube:
@@ -61,7 +66,7 @@ def panoramic_da(color_tensor, model, device="cuda"):
     disp_sharp_unmerged = cube2equi_pad(disp_sharp_cube, 120)
 
     aligner = Aligner()
-    disps_aligned = aligner.align(dict_to_tensor(disp_sharp_cube), fov=120)
+    disps_aligned = aligner.align(dict_to_tensor(disp_sharp_cube), depth[0], fov=120)
 
     disp_aligned_unmerged = cube2equi_pad(disps_aligned, 120, "tensor")
     disp_sharp = merge_cube2equi(disp_aligned_unmerged, fov=120, type="tensor")
@@ -84,6 +89,9 @@ if __name__ == "__main__":
         "--color", type=str, required=True, help="Path to the panorama image."
     )
     parser.add_argument(
+        "--depth", type=str, required=False, help="Path to the depth map."
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda",
@@ -94,7 +102,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     color_tensor = load_color(args.color, device=args.device)
-    # depth_tensor = load_depth(args.depth, device=args.device)
+    depth_tensor = load_depth(args.depth, device=args.device)
 
     print(f"Color tensor shape: {color_tensor.shape}")
     # print(f"Depth tensor shape: {depth_tensor.shape}")
@@ -110,4 +118,4 @@ if __name__ == "__main__":
         .eval()
     )
 
-    panoramic_da(color_tensor, model, device=args.device)
+    panoramic_da(color_tensor, depth_tensor, model, device=args.device)
