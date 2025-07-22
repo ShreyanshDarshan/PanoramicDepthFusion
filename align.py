@@ -1,0 +1,230 @@
+import matplotlib.pyplot
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from utils import (
+    equi2cube_pad,
+    cube2equi_pad,
+    FACE_LIST,
+    tensor_to_dict,
+    merge_cube2equi,
+)
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import matplotlib
+
+
+class Scaler(nn.Module):
+    def __init__(self, grid_size=5, num_disps=6):
+        super(Scaler, self).__init__()
+        self.grid_size = grid_size
+        self.T = num_disps
+        self.scale_grid = nn.Parameter(
+            torch.ones((self.T, grid_size, grid_size), requires_grad=True)
+        )
+        self.offset_grid = nn.Parameter(
+            torch.zeros((self.T, grid_size, grid_size), requires_grad=True)
+        )
+
+    def forward(self, disps):
+        T, _, H, W = disps.shape
+        assert T == self.T, f"Expected {self.T} disparity samples, but got {T}"
+        scale_high = F.interpolate(
+            self.scale_grid[:, None, ...],
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        )
+        offset_high = F.interpolate(
+            self.offset_grid[:, None, ...],
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        )
+        disps = disps * scale_high + offset_high
+        return disps
+
+
+class Aligner:
+    def __init__(
+        self,
+        grid_size=[5, 10, 15],
+        lr=[1e-2, 1e-2, 1e-2],
+        align_iters=[10, 10, 10],
+        px_ratio=0.01,
+        num_disps=6,
+        device="cuda",
+    ):
+        self.grid_size = grid_size
+        self.num_stages = len(grid_size)
+        self.lr = lr
+        self.align_iters = align_iters
+        self.num_disps = num_disps
+        self.scalers = [
+            Scaler(grid_size=g, num_disps=num_disps).to(device) for g in grid_size
+        ]
+        self.px_ratio = px_ratio
+        self.writer = SummaryWriter("runs/aligner")
+
+    def align(self, disps, fov=120):
+        """
+        Align disparity maps across multiple stages.
+        Args:
+            disps (torch.Tensor): Disparity maps of shape (F, C, H, W).
+            fov (int): Field of view for the cube to equi conversion.
+        """
+        disps = self.normalize_disps(disps)
+        pair_masks = self.get_masks(disps, fov=fov)
+
+        for stage in range(self.num_stages):
+            self.align_stage(disps, pair_masks, stage, fov=fov)
+            self.scalers[stage].eval()
+            with torch.no_grad():
+                disps = self.scalers[stage](disps)
+            self.scalers[stage].train()
+
+        return disps
+
+    def align_stage(self, disps, masks, stage, fov=120):
+        optimizer = torch.optim.Adam(
+            self.scalers[stage].parameters(), lr=self.lr[stage]
+        )
+        self.scalers[stage].train()
+        for step in tqdm(
+            range(self.align_iters[stage])
+        ):  # Number of iterations per stage
+            optimizer.zero_grad()
+            scaled_disps = self.scalers[stage](disps)
+            loss_dict = self.loss(scaled_disps, masks, stage)
+            loss = loss_dict["total_loss"]
+
+            loss.backward()
+            optimizer.step()
+
+            self.writer.add_scalars(f"aligner/stage_{stage}/loss", loss_dict, step)
+            if step % 10 == 0 or step == self.align_iters[stage] - 1:
+                eval_out = self.eval_iter(disps, stage, fov=fov)
+                self.writer.add_image(
+                    f"aligner/stage_{stage}/equi_disp",
+                    eval_out["equi_disp_img"],
+                    step,
+                    dataformats="HWC",
+                )
+                self.writer.add_image(
+                    f"aligner/stage_{stage}/scalar_img",
+                    eval_out["scalar_img"],
+                    step,
+                    dataformats="HWC",
+                )
+
+    def loss(self, disps, pair_masks, stage):
+        loss_dict = {
+            "alignment_loss": self.alignment_loss(disps, pair_masks),
+            "smoothness_loss": 40 * self.smoothness_loss(stage),
+            "scale_loss": 0.007 * self.scale_loss(stage),
+        }
+        loss_dict["total_loss"] = sum(loss_dict.values())
+        return loss_dict
+
+    def alignment_loss(self, disps, pair_masks):
+        loss = 0.0
+        equi_disps = cube2equi_pad(disps, fov=120, type="tensor")
+        equi_disps_dict = tensor_to_dict(equi_disps)
+        for face1, face2 in pair_masks:
+            mask = pair_masks[(face1, face2)]
+            disp1 = equi_disps_dict[face1]
+            disp2 = equi_disps_dict[face2]
+            diff = disp1[mask] - disp2[mask]
+            # px_mask = torch.rand(diff.numel(), device=diff.device) < self.px_ratio
+            # diff_masked = diff.view(-1)[px_mask]
+            # select random pixels for loss calculation
+            loss += (diff**2).mean()
+        loss /= len(pair_masks)
+        return loss
+
+    def smoothness_loss(self, stage):
+        scaler = self.scalers[stage]
+        scale_grid = scaler.scale_grid
+        offset_grid = scaler.offset_grid
+        scale_xgrad = (scale_grid[:, 1:, :] - scale_grid[:, :-1, :]) ** 2
+        scale_ygrad = (scale_grid[:, :, 1:] - scale_grid[:, :, :-1]) ** 2
+        offset_xgrad = (offset_grid[:, 1:, :] - offset_grid[:, :-1, :]) ** 2
+        offset_ygrad = (offset_grid[:, :, 1:] - offset_grid[:, :, :-1]) ** 2
+        loss = (
+            scale_xgrad.mean()
+            + scale_ygrad.mean()
+            + offset_xgrad.mean()
+            + offset_ygrad.mean()
+        )
+        return loss
+
+    def scale_loss(self, stage):
+        scaler = self.scalers[stage]
+        scale_grid = scaler.scale_grid
+        loss = (1 / scale_grid).mean()
+        return loss
+
+    def get_masks(self, disps, fov=120):
+        masks = torch.ones_like(disps, dtype=torch.uint8).to(disps.device)
+        masks_equi = cube2equi_pad(masks, fov=fov, type="tensor").to(torch.bool)
+        masks_equi = tensor_to_dict(masks_equi)
+
+        pair_masks = {}
+        for face1 in FACE_LIST:
+            for face2 in FACE_LIST:
+                key = (face1, face2)
+                mask = masks_equi[face1] & masks_equi[face2]
+                if face1 != face2 and key not in pair_masks and mask.any():
+                    pair_masks[key] = mask
+        return pair_masks
+
+    def eval_iter(self, disps, stage, fov=120):
+        self.scalers[stage].eval()
+        with torch.no_grad():
+            scaled_disps = self.scalers[stage](disps)
+            equi_disps = cube2equi_pad(scaled_disps, fov=fov, type="tensor")
+            equi_disp = merge_cube2equi(equi_disps, fov=fov, type="tensor")
+            # colormap for visualization
+            equi_disp = (equi_disp - equi_disp.min()) / (
+                equi_disp.max() - equi_disp.min()
+            )
+            equi_disp = (equi_disp * 255).byte().cpu().numpy()
+            equi_disp = np.transpose(equi_disp, (1, 2, 0))[..., 0]  # H, W
+            equi_disp = matplotlib.colormaps.get_cmap("turbo")(equi_disp)[:, :, :3]
+            equi_disp = (equi_disp * 255).astype(np.uint8)
+        self.scalers[stage].train()
+
+        scale_imgs = self.scalers[stage].scale_grid.detach().cpu().numpy()
+        scale_imgs = (scale_imgs - scale_imgs.min()) / (
+            scale_imgs.max() - scale_imgs.min()
+        )
+        scale_imgs = (scale_imgs * 255).astype(np.uint8)
+        offset_imgs = self.scalers[stage].offset_grid.detach().cpu().numpy()
+        offset_imgs = (offset_imgs - offset_imgs.min()) / (
+            offset_imgs.max() - offset_imgs.min()
+        )
+        offset_imgs = (offset_imgs * 255).astype(np.uint8)
+
+        F, sh, sw = scale_imgs.shape
+        scalar_img = np.zeros((sh, F * sw, 3), dtype=np.uint8)
+        for i, (scale_img, offset_img) in enumerate(zip(scale_imgs, offset_imgs)):
+            scalar_img[:, i * sw : (i + 1) * sw, 0] = scale_img
+            scalar_img[:, i * sw : (i + 1) * sw, 1] = offset_img
+
+        eval_out = {
+            "equi_disp_img": equi_disp,
+            "scalar_img": scalar_img,
+        }
+        return eval_out
+
+    def normalize_disps(self, disps):
+        """
+        Normalize the disparity maps to the range [0, 1].
+        """
+        F, C, H, W = disps.shape
+        disps_median = torch.median(disps.view(F, -1), dim=1, keepdim=True).values
+        disps_dev = disps - disps_median[..., None, None]
+        disps_scale = disps_dev.abs().mean()
+        disps = disps_dev / (disps_scale + 1e-6)
+        return disps
